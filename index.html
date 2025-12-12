@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fourier Transform India Map</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #050505;
+            color: #ccc;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+
+        canvas {
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 1.5rem;
+            color: #00ffcc;
+            pointer-events: none;
+            text-align: center;
+        }
+
+        .controls {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px;
+            border-radius: 8px;
+            pointer-events: auto;
+        }
+
+        .controls label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading">Loading Map Data...</div>
+    <canvas id="canvas"></canvas>
+
+    <div class="controls">
+        <label>
+            <input type="checkbox" id="showCircles" checked> Show Epicycles
+        </label>
+        <label>
+            <input type="checkbox" id="showPath" checked> Show Drawing Path
+        </label>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const loadingDiv = document.getElementById('loading');
+        
+        let width, height;
+        let fourierX = [];
+        let time = 0;
+        let path = [];
+        let drawingPoints = []; // The raw points from JSON
+        let state = -1; // -1: loading, 0: drawing
+        
+        // Configuration
+        let skipStep = 1; // Increase to reduce resolution if it's too slow (e.g., 2, 3)
+        
+        // Resize canvas
+        function resize() {
+            width = window.innerWidth;
+            height = window.innerHeight;
+            canvas.width = width;
+            canvas.height = height;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        // Complex Number Class
+        class Complex {
+            constructor(a, b) {
+                this.re = a;
+                this.im = b;
+            }
+
+            add(c) {
+                this.re += c.re;
+                this.im += c.im;
+            }
+
+            mult(c) {
+                const re = this.re * c.re - this.im * c.im;
+                const im = this.re * c.im + this.im * c.re;
+                return new Complex(re, im);
+            }
+        }
+
+        // Discrete Fourier Transform
+        function dft(x) {
+            const X = [];
+            const N = x.length;
+
+            for (let k = 0; k < N; k++) {
+                let sum = new Complex(0, 0);
+
+                for (let n = 0; n < N; n++) {
+                    const phi = (2 * Math.PI * k * n) / N;
+                    const c = new Complex(Math.cos(phi), -Math.sin(phi));
+                    sum.add(x[n].mult(c));
+                }
+
+                sum.re = sum.re / N;
+                sum.im = sum.im / N;
+
+                let freq = k;
+                let amp = Math.sqrt(sum.re * sum.re + sum.im * sum.im);
+                let phase = Math.atan2(sum.im, sum.re);
+
+                X[k] = { re: sum.re, im: sum.im, freq, amp, phase };
+            }
+
+            // Sort by amplitude so largest circles are first (for better visuals)
+            X.sort((a, b) => b.amp - a.amp);
+            return X;
+        }
+
+        async function loadData() {
+            try {
+                const response = await fetch('in.json');
+                if (!response.ok) throw new Error('Network response was not ok');
+                const data = await response.json();
+                processGeoJSON(data);
+            } catch (error) {
+                console.error("Error loading JSON:", error);
+                loadingDiv.innerHTML = "Error loading 'in.json'.<br>Make sure the file is in the same folder and you are running a local server.";
+                loadingDiv.style.color = "#ff4444";
+            }
+        }
+
+        function processGeoJSON(data) {
+            let allPolygons = [];
+
+            // Extract polygons from GeoJSON
+            // Assuming standard GeoJSON structure (FeatureCollection -> Features -> Geometry)
+            const features = data.features || [data]; // Handle if it's just a Feature
+
+            features.forEach(feature => {
+                if (feature.geometry && feature.geometry.type === "MultiPolygon") {
+                    feature.geometry.coordinates.forEach(polygon => {
+                        // GeoJSON polygons are usually arrays of rings. The first ring is the outer boundary.
+                        allPolygons.push(polygon[0]); 
+                    });
+                } else if (feature.geometry && feature.geometry.type === "Polygon") {
+                    allPolygons.push(feature.geometry.coordinates[0]);
+                }
+            });
+
+            if (allPolygons.length === 0) {
+                loadingDiv.textContent = "No polygon data found.";
+                return;
+            }
+
+            // Find the largest polygon (Mainland India) to draw
+            // A simple heuristic is the one with the most points
+            let mainPolygon = allPolygons.reduce((a, b) => a.length > b.length ? a : b);
+
+            // Normalize points to fit canvas
+            // GeoJSON is [Long, Lat]. Long = X, Lat = Y.
+            // Note: Screen Y is down, Map Y (Lat) is up.
+            
+            let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+            
+            mainPolygon.forEach(p => {
+                const x = p[0];
+                const y = p[1];
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+            });
+
+            const rangeX = maxX - minX;
+            const rangeY = maxY - minY;
+            
+            // Scale to fit 80% of smallest screen dimension
+            const scale = Math.min(width, height) * 0.7; 
+            const scaleX = scale / Math.max(rangeX, rangeY); // Maintain aspect ratio
+            const scaleY = scaleX; // Uniform scaling
+
+            // Skip points to improve performance if too many
+            // DFT is O(N^2), so N should be < 3000 ideally for browser startup time
+            let step = 1;
+            if (mainPolygon.length > 2000) step = Math.ceil(mainPolygon.length / 1500);
+
+            for (let i = 0; i < mainPolygon.length; i += step) {
+                const p = mainPolygon[i];
+                // Center the map
+                // Flip Y because screen Y goes down
+                const screenX = (p[0] - minX - rangeX/2) * scaleX; 
+                const screenY = -(p[1] - minY - rangeY/2) * scaleY; 
+                
+                drawingPoints.push(new Complex(screenX, screenY));
+            }
+
+            loadingDiv.textContent = "Computing Fourier Transform...";
+            
+            // Allow UI to update before blocking with math
+            setTimeout(() => {
+                fourierX = dft(drawingPoints);
+                loadingDiv.style.display = 'none';
+                time = 0;
+                path = [];
+                state = 0; // Start drawing
+                animate();
+            }, 100);
+        }
+
+        function drawEpicycles(x, y, rotation, fourier) {
+            for (let i = 0; i < fourier.length; i++) {
+                let prevx = x;
+                let prevy = y;
+                
+                let freq = fourier[i].freq;
+                let radius = fourier[i].amp;
+                let phase = fourier[i].phase;
+                
+                x += radius * Math.cos(freq * time + phase + rotation);
+                y += radius * Math.sin(freq * time + phase + rotation);
+
+                // Draw Circle
+                if (document.getElementById('showCircles').checked) {
+                    ctx.strokeStyle = "rgba(255, 255, 255, 0.15)";
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.arc(prevx, prevy, radius, 0, 2 * Math.PI);
+                    ctx.stroke();
+
+                    // Draw Line (Radius)
+                    ctx.strokeStyle = "rgba(255, 255, 255, 0.4)";
+                    ctx.beginPath();
+                    ctx.moveTo(prevx, prevy);
+                    ctx.lineTo(x, y);
+                    ctx.stroke();
+                }
+            }
+            return { x, y };
+        }
+
+        function animate() {
+            if (state !== 0) return;
+            requestAnimationFrame(animate);
+
+            ctx.fillStyle = "#050505";
+            ctx.fillRect(0, 0, width, height);
+
+            // Center of screen
+            let vx = width / 2;
+            let vy = height / 2;
+
+            // Compute the vector position
+            let v = drawEpicycles(vx, vy, 0, fourierX);
+            
+            // Add point to path
+            // We use unshift to add to the beginning, but since we redraw everything, 
+            // array order just needs to be consistent. 
+            // Push is faster.
+            path.push(v); 
+
+            // Draw the traced path
+            if (document.getElementById('showPath').checked) {
+                ctx.beginPath();
+                ctx.lineWidth = 2;
+                // Gradient for the line
+                const gradient = ctx.createLinearGradient(0, 0, width, height);
+                gradient.addColorStop(0, "#FF9933"); // Saffron
+                gradient.addColorStop(0.5, "#FFFFFF"); // White
+                gradient.addColorStop(1, "#138808"); // Green
+                ctx.strokeStyle = gradient;
+
+                for (let i = 0; i < path.length; i++) {
+                    if (i === 0) ctx.moveTo(path[i].x, path[i].y);
+                    else ctx.lineTo(path[i].x, path[i].y);
+                }
+                ctx.stroke();
+            }
+
+            // Loop time
+            const dt = (2 * Math.PI) / fourierX.length;
+            time += dt;
+
+            // Reset if complete loop to prevent infinite array growth
+            if (time > 2 * Math.PI) {
+                time = 0;
+                path = [];
+            }
+        }
+
+        // Initialize
+        loadData();
+
+    </script>
+</body>
+</html>
+
+
